@@ -13,14 +13,21 @@ from ..cache import Cache
 from ..util.tensor import g_tensor_cache
 from .multilinear import SlicedMultiLinear
 import os
+import weakref
 
 # Sliced qkv+z projection bundle at decode for the split-projection GDN (Qwen3.5 / Qwen3.8 style):
 # one mgemm over equal-width column slices, see attn.py. EXL3_QKV_SLICE=0 disables it
 # (off by default on ROCm: the RDNA multi-matrix GEMVs do not take sliced bundles, which would fall back to
 # the cooperative GEMM)
 _qkv_slice_enable = QKV_SLICE
+# Accepted-input replay keeps only the committed state and the small verification inputs.
+_gdn_replay_enable = os.environ.get("EXL3_GDN_REPLAY", "0") == "1"
 # EXL3_BC_GDN=0 disables the graph-captured decode paths (torch path only), for A/B testing
 _bc_gdn_enable = os.environ.get("EXL3_BC_GDN", "1") != "0"
+# Replay verification also runs in the BC graph: noncommitting conv and scan, with the record kept
+# in per-layer statics and committed for all layers by one batched call per rewind (GDNReplayBuffers).
+# EXL3_BC_GDN_REPLAY=0 sends replay verification back to the eager path, for A/B testing
+_bc_replay_enable = os.environ.get("EXL3_BC_GDN_REPLAY", "1") != "0"
 # Prefill projections (qkv, z, forget/beta gates) come out of the GEMM in fp16 rather than fp32.
 # EXL3_GDN_PROJ_FP32=1 restores fp32
 _proj_dtype = torch.float if os.environ.get("EXL3_GDN_PROJ_FP32", "0") != "0" else torch.half
@@ -49,10 +56,21 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
     launching them all under one device index dereferences foreign pointers (illegal memory
     access on any multi-GPU split). Only GDNLayerState instances (GDN and Mamba2 alike) are
     batched; any other recurrent-state type sharing the same cache (e.g. SWA, short-conv)
-    falls back to its own .rewind() call, unchanged."""
+    falls back to its own .rewind() call, unchanged. Replay-enabled GDN layers instead
+    contribute to the second return value, a replay plan (slot, eager layers, batched job
+    groups by device and geometry), validated here for every layer before anything runs."""
     jobs_by_device = {}
+    accepted = last_history + 1 - num_tokens
+    replay_eager = []
+    replay_groups = {}
     for l in layers:
-        if isinstance(l, GDNLayerState):
+        if isinstance(l, GDNLayerState) and l.replay_enabled:
+            plan = l.prepare_replay(slot, accepted)
+            if plan == "eager":
+                replay_eager.append((l, accepted))
+            elif plan is not None:
+                replay_groups.setdefault(plan[0], []).append((l, plan[1]))
+        elif isinstance(l, GDNLayerState):
             # l.device may be a plain string ("cuda:0") in some TP contexts rather than a
             # torch.device, so normalize rather than assume a .index attribute
             device_index = torch.device(l.device).index
@@ -65,15 +83,35 @@ def _collect_rewind_jobs(layers, slot: int, last_history: int, num_tokens: int):
                 state_jobs.append(sj)
         else:
             l.rewind(slot, last_history, num_tokens)
-    return jobs_by_device
+    return jobs_by_device, (slot, replay_eager, replay_groups)
 
 
-def _dispatch_rewind_jobs(jobs_by_device):
+def _dispatch_rewind_jobs(jobs):
+    jobs_by_device, replay_plan = jobs
     for device_index, (conv_jobs, state_jobs) in jobs_by_device.items():
         if conv_jobs:
             ext.batched_conv_rewind(conv_jobs, device_index)
         if state_jobs:
             ext.batched_state_rewind(state_jobs, device_index)
+    _dispatch_replay(*replay_plan)
+
+
+def _dispatch_replay(slot: int, replay_eager: list, replay_groups: dict):
+    """Commit a validated replay plan. Each record is released only once its commit has been
+    submitted; a commit that raises marks its records failed (GDNLayerState.fail_replay), since
+    part of it may already have run and a retry would advance the state twice"""
+    for l, accepted in replay_eager:
+        l.commit_replay_eager(slot, accepted)
+    # Key: (GDNLayerState.replay_key, accepted, record seqlen), see GDNLayerState.prepare_replay
+    for ((device_index, *geometry), accepted, seqlen), entries in replay_groups.items():
+        try:
+            ext.batched_gdn_replay([job for _, job in entries], device_index, accepted, seqlen, *geometry)
+        except BaseException:
+            for l, _ in entries:
+                l.fail_replay(slot)
+            raise
+        for l, _ in entries:
+            l._pop_replay(slot)
 
 
 def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, last_history, num_tokens):
@@ -82,7 +120,102 @@ def mp_cache_recurrent_rewind(local_context: dict, cache_id: int, slot: int, las
     _dispatch_rewind_jobs(_collect_rewind_jobs(layers, slot, last_history, num_tokens))
 
 
+def mp_cache_recurrent_discard_replay(local_context: dict, cache_id: int, slot: int | None):
+    for module in local_context["recurrent_modules"]:
+        layer = module.tp_recurrent_lookup[cache_id]
+        discard = getattr(layer, "discard_replay", None)
+        if discard is not None:
+            discard(slot)
+
+
+class GDNReplayBuffers:
+    """Statics of one BC replay-verify graph slot (bsz, seqlen): conv input, post-conv qkv, beta
+    and g, viewing the start of a GDNReplayStorage bucket at fixed addresses (baked into the
+    graph). Row i of the slot's last verify is the replay record (buffers, i) of the batch's
+    i-th state until it is committed, discarded or evicted"""
+
+    def __init__(self, storage: GDNReplayStorage, tensors: tuple):
+        self.storage = storage
+        self.tensors = tensors
+        self.seqlen = tensors[1].shape[1]
+        # Row addresses are integer arithmetic on the base pointers, like the rewind jobs
+        self.ptrs = [t.data_ptr() for t in tensors]
+        self.row_bytes = [t.stride(0) * t.element_size() for t in tensors]
+
+    def row_ptrs(self, row: int):
+        return [p + row * b for p, b in zip(self.ptrs, self.row_bytes)]
+
+    def eager_record(self, row: int):
+        # Private copy in the eager record layout (channel-major bf16 conv input)
+        conv_input, conv_out, beta, g = (t[row:row + 1].clone() for t in self.tensors)
+        return conv_input, conv_out, beta, g, False
+
+
+class GDNReplayStorage:
+    """Per-layer recording storage behind all BC replay-verify slots of a GatedDeltaNet. Slots view
+    the start of a capacity bucket of a power-of-two number of token rows. A bucket is never
+    reallocated, so captured graphs and cached replay jobs stay valid; a larger shape adds a new
+    bucket for itself, and all buckets together stay under twice the largest.
+
+    Slots alias, so `claims` holds every unresolved record in this storage, from any cache.
+    evict() runs before each replay verify and copies those records into private eager records
+    (normally there are none). A cache abandoned with records pending, or one interleaved with
+    another cache, therefore costs one copy instead of blocking the graph path."""
+
+    def __init__(self, module: GatedDeltaNet):
+        self.module = module
+        self.bucket = None      # (rows, conv_input, conv_out, beta, g), flat
+        self.claims = {}        # (id(layer_state), slot) -> (weakref(layer_state), slot, record)
+        self.evictions = 0
+
+    def buffers(self, bsz: int, seqlen: int):
+        m = self.module
+        rows = bsz * seqlen
+        f, nv = m.fdim_qkv, m.num_v_heads
+        g_inner = (nv, m.k_head_dim) if m.kda else (nv,)
+        g_row = nv * (m.k_head_dim if m.kda else 1)
+        if self.bucket is None or self.bucket[0] < rows:
+            cap = 1 << (rows - 1).bit_length()
+            self.bucket = (
+                cap,
+                torch.empty((cap * f,), dtype = torch.bfloat16, device = m.device),
+                torch.empty((cap * f,), dtype = torch.bfloat16, device = m.device),
+                torch.empty((cap * nv,), dtype = torch.bfloat16, device = m.device),
+                torch.empty((cap * g_row,), dtype = torch.float, device = m.device),
+            )
+        _, conv_input, conv_out, beta, g = self.bucket
+        return GDNReplayBuffers(self, (
+            conv_input[:rows * f].view(bsz, f, seqlen),
+            conv_out[:rows * f].view(bsz, seqlen, f),
+            beta[:rows * nv].view(bsz, seqlen, nv),
+            g[:rows * g_row].view(bsz, seqlen, *g_inner),
+        ))
+
+    def claim(self, layer_state: GDNLayerState, slot: int, record: tuple):
+        self.claims[(id(layer_state), slot)] = (weakref.ref(layer_state), slot, record)
+
+    def release(self, layer_state: GDNLayerState, slot: int):
+        self.claims.pop((id(layer_state), slot), None)
+
+    def evict(self):
+        # Stream-ordered: the copies are queued before the verify that overwrites the storage
+        for ref, slot, record in list(self.claims.values()):
+            state = ref()
+            if state is not None and state.pending_replay.get(slot) is record:
+                state.pending_replay[slot] = record[0].eager_record(record[1])
+                self.evictions += 1
+        self.claims.clear()
+
+
+# Pending-replay marker for a commit that raised partway, see GDNLayerState.fail_replay
+_REPLAY_FAILED = "failed"
+
+
 class GDNState:
+
+    @property
+    def replay_enabled(self):
+        return _gdn_replay_enable
 
     def __init__(
         self,
@@ -125,6 +258,8 @@ class GDNState:
 
 
     def rewind(self, num_tokens: int):
+        # Metadata advanced over every verify row. Replay commits M - num_tokens inputs,
+        # including the seed row, before the rejected suffix is removed from the position.
         if not self.cache.model.loaded_tp:
             _dispatch_rewind_jobs(_collect_rewind_jobs(
                 self.cache.get_all_recurrent_layers().values(), self.slot, self.last_history, num_tokens
@@ -193,13 +328,21 @@ class GDNLayerState:
         cache_id: int,
     ):
         self.module = module
+        # Mamba2 shares this state class but still uses its original history implementation.
+        self.replay_enabled = _gdn_replay_enable and isinstance(module, GatedDeltaNet)
+        history_slots = 0 if self.replay_enabled else max_history
+        # slot -> eager record (conv_input, mixed_qkv, beta, g, token_major), BC record
+        # (GDNReplayBuffers, row) or _REPLAY_FAILED. Remove entries only through _pop_replay
+        self.pending_replay = {}
+        self.replay_key = None
+        self.replay_job_cache = {}
         self.conv_state = torch.empty(
-            (max_batch_size, module.fdim_qkv, module.conv_kernel_size + max_history),
+            (max_batch_size, module.fdim_qkv, module.conv_kernel_size + history_slots),
             dtype = torch.bfloat16,
             device = "meta"
         )
         self.recurrent_state = torch.empty(
-            (max_batch_size, max_history + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
+            (max_batch_size, history_slots + 1, module.num_v_heads, module.k_head_dim, module.v_head_dim),
             dtype = torch.float,
             device = "meta"
         )
@@ -226,15 +369,26 @@ class GDNLayerState:
         self.conv_state.zero_()
         self.recurrent_state.zero_()
         self.device = device
+        if self.replay_enabled:
+            # Device and geometry arguments of ext.batched_gdn_replay, also its job grouping key
+            m = self.module
+            self.replay_key = (
+                torch.device(device).index, m.num_k_heads, m.num_v_heads, m.k_head_dim, m.v_head_dim,
+                m.fdim_qkv, m.conv_kernel_size, self.conv_state.stride(1), bool(m.kda)
+            )
+            self.replay_job_cache = {}
 
 
     def free(self):
+        self.discard_replay()
+        self.replay_job_cache = {}
         self.conv_state = torch.empty_like(self.conv_state, device = "meta")
         self.recurrent_state = torch.empty_like(self.recurrent_state, device = "meta")
         self.device = None
 
 
     def clear(self, idx: int):
+        self.discard_replay(idx)
         if self.device is not None:
             self.conv_state[idx].zero_()
             self.recurrent_state[idx].zero_()
@@ -247,7 +401,134 @@ class GDNLayerState:
         )
 
 
+    def _pop_replay(self, slot: int):
+        record = self.pending_replay.pop(slot, None)
+        if isinstance(record, tuple) and isinstance(record[0], GDNReplayBuffers):
+            record[0].storage.release(self, slot)
+        return record
+
+
+    def discard_replay(self, slot: int | None = None):
+        for s in (list(self.pending_replay) if slot is None else [slot]):
+            self._pop_replay(s)
+
+
+    def record_replay_bc(self, states, buffers: GDNReplayBuffers):
+        # The BC graph already wrote the inputs into the layer's statics; row i belongs to states[i]
+        for i, state in enumerate(states):
+            assert state.slot not in self.pending_replay, "Unresolved GDN verification"
+            record = (buffers, i)
+            self.pending_replay[state.slot] = record
+            buffers.storage.claim(self, state.slot, record)
+
+
+    def record_replay(self, states, conv_input, mixed_qkv, beta, g, token_major):
+        # Keep the original dtypes and layout, including token-major fp16/fp32 conv inputs.
+        # q is retained with k/v so the existing packed recurrent kernel can replay unchanged.
+        for i, state in enumerate(states):
+            assert state.slot not in self.pending_replay, "Unresolved GDN verification"
+            self.pending_replay[state.slot] = (
+                conv_input[i:i + 1], mixed_qkv[i:i + 1], beta[i:i + 1], g[i:i + 1], token_major
+            )
+
+
+    def prepare_replay(self, slot: int, accepted: int):
+        """Validate the slot's pending verification and plan its commit, consuming nothing: None
+        (nothing to commit), "eager" (commit_replay_eager) or (group key, ext.GDNReplayJob) for
+        _dispatch_replay. Only accepted = 0, which commits nothing, releases the record here"""
+        record = self.pending_replay.get(slot)
+        # A one-row non-speculative forward has no pending inputs and already committed.
+        if record is None:
+            return None
+        if record is _REPLAY_FAILED:
+            raise RuntimeError(f"GDN replay of slot {slot} failed partway; its state stays undefined "
+                               "until the slot is cleared, restored or released")
+        bc = isinstance(record[0], GDNReplayBuffers)
+        seqlen = record[0].seqlen if bc else record[1].shape[1]
+        if not 0 <= accepted <= seqlen:
+            raise ValueError(f"Invalid GDN accepted length {accepted} for a {seqlen}-row verification")
+        if not accepted:
+            self._pop_replay(slot)
+            return None
+        if not bc:
+            return "eager"
+        buffers, row = record
+        # Addresses depend only on (statics, row, slot), all fixed between alloc() and free()
+        job = self.replay_job_cache.get((buffers, row, slot))
+        if job is None:
+            rs, cs = self.recurrent_state, self.conv_state
+            job = ext.GDNReplayJob(
+                rs.data_ptr() + slot * rs.stride(0) * rs.element_size(),
+                cs.data_ptr() + slot * cs.stride(0) * cs.element_size(),
+                *buffers.row_ptrs(row),
+            )
+            self.replay_job_cache[(buffers, row, slot)] = job
+        return (self.replay_key, accepted, buffers.seqlen), job
+
+
+    def commit_replay_eager(self, slot: int, accepted: int):
+        try:
+            self._replay_eager(slot, accepted, *self.pending_replay[slot])
+        except BaseException:
+            self.fail_replay(slot)
+            raise
+        self._pop_replay(slot)
+
+
+    def fail_replay(self, slot: int):
+        # Part of the commit may have run. Keep the slot unresolved, so forwards, checkpoints and
+        # replays refuse it, until it is cleared, restored or released
+        self._pop_replay(slot)
+        self.pending_replay[slot] = _REPLAY_FAILED
+
+
+    def replay(self, slot: int, accepted: int):
+        plan = self.prepare_replay(slot, accepted)
+        if plan == "eager":
+            _dispatch_replay(slot, [(self, accepted)], {})
+        elif plan is not None:
+            _dispatch_replay(slot, [], {plan[0]: [(self, plan[1])]})
+
+
+    def _replay_eager(self, slot: int, accepted: int, conv_input, mixed_qkv, beta, g, token_major):
+        assert 0 <= accepted <= mixed_qkv.shape[1], "Invalid GDN accepted length"
+        if accepted:
+            module = self.module
+            # Reuse exactly the recurrent scan used for verification, even for long blocks.
+            # Slicing the slot gives a contiguous single-state batch, so no slot map is needed.
+            gated_delta_rule_fn(
+                mixed_qkv = mixed_qkv[:, :accepted].contiguous(),
+                beta = beta[:, :accepted].contiguous(),
+                g = g[:, :accepted].contiguous(),
+                recurrent_state = self.recurrent_state[slot:slot + 1],
+                recurrent_slots = None,
+                history = False,
+                save_state = True,
+                num_k_heads = module.num_k_heads,
+                num_v_heads = module.num_v_heads,
+                k_dim = module.k_dim,
+                v_dim = module.v_dim,
+                k_head_dim = module.k_head_dim,
+                v_head_dim = module.v_head_dim,
+                channelwise_g = module.kda,
+                force_recurrent = True,
+            )
+            conv_prefix = conv_input[:, :accepted] if token_major else conv_input[:, :, :accepted]
+            causal_conv1d_update(
+                mixed_qkv = conv_prefix.contiguous(),
+                conv_state = self.conv_state[slot:slot + 1],
+                recurrent_slots = None,
+                conv1d_weight = module.conv1d_weight_flat,
+                conv1d_bias = module.conv1d_bias,
+                history = False,
+                token_major = token_major,
+            )
+
+
     def rewind(self, slot: int, last_history: int, num_tokens: int):
+        if self.replay_enabled:
+            self.replay(slot, last_history + 1 - num_tokens)
+            return
         assert num_tokens <= last_history
         if num_tokens > 0:
             r_state = self.recurrent_state[slot, 0]
@@ -300,6 +581,7 @@ class GDNLayerState:
 
 
     def stash(self, slot, position: int = 0):
+        assert slot not in self.pending_replay, "Commit GDN verification before checkpointing"
         cdim = self.module.conv_kernel_size
         return (
             host_copy(self.recurrent_state[slot, :1]),
@@ -308,6 +590,7 @@ class GDNLayerState:
 
 
     def unstash(self, slot, stashed, position: int = 0):
+        self.discard_replay(slot)
         cdim = self.module.conv_kernel_size
         s, c = stashed
         self.recurrent_state[slot, :1].copy_(s)
@@ -597,6 +880,8 @@ class GatedDeltaNet(Module):
 
         self.bc = None
         self.bc_split = False
+        self.bc_replay_buffers = {}
+        self.bc_replay_storage = None
         self.bsz1_pa_args = []
         self.ba_weight_t = None
         self.ba_bias = None
@@ -838,6 +1123,8 @@ class GatedDeltaNet(Module):
             self.bc = None
             self.bc_split = False
             self.bsz1_pa_args = []
+        self.bc_replay_buffers = {}
+        self.bc_replay_storage = None
         self.ba_weight_t = None
         self.ba_bias = None
         self.ba_weight_filled = False
@@ -899,7 +1186,18 @@ class GatedDeltaNet(Module):
         return mixed_qkv, z, b, a
 
 
-    def _bc_configure_slot_kda(self, bsz: int, seqlen: int, history: bool):
+    def _bc_replay_statics(self, bsz: int, seqlen: int):
+        """Per-layer conv input, post-conv qkv, beta and g for a replay-verify slot. They hold the
+        verification record until rewind, so unlike the other statics they cannot be shared
+        between layers through g_tensor_cache (see GDNReplayStorage)"""
+        if self.bc_replay_storage is None:
+            self.bc_replay_storage = GDNReplayStorage(self)
+        buffers = self.bc_replay_storage.buffers(bsz, seqlen)
+        self.bc_replay_buffers[(bsz, seqlen)] = buffers
+        return buffers.tensors
+
+
+    def _bc_configure_slot_kda(self, bsz: int, seqlen: int, history: bool, replay: bool = False):
         device = self.device
         f = self.fdim_qkv
         nv, hk, hv = self.num_v_heads, self.k_head_dim, self.v_head_dim
@@ -909,10 +1207,13 @@ class GatedDeltaNet(Module):
         fa_out          = g_tensor_cache.get(device, (bsz, seqlen, hk), torch.float, "s_kfa")
         fb_out          = g_tensor_cache.get(device, (bsz, seqlen, nv * hk), torch.float, "s_kfb")
         ga_out          = g_tensor_cache.get(device, (bsz, seqlen, hv), torch.float, "s_kga")
-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
-        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        if replay:
+            mixed_qkv, conv_out, beta, g = self._bc_replay_statics(bsz, seqlen)
+        else:
+            beta        = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+            g           = g_tensor_cache.get(device, (bsz, seqlen, nv, hk), torch.float, "s_kg4")
+            mixed_qkv   = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+            conv_out    = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
@@ -920,7 +1221,7 @@ class GatedDeltaNet(Module):
         self.bc.configure_slot_kda(
             bsz, seqlen, history,
             qkv, z, b_out, fa_out, fb_out, ga_out, beta, g, mixed_qkv, conv_out,
-            core_attn_out, core_attn_out_f, qkv_xh, o_xh,
+            core_attn_out, core_attn_out_f, qkv_xh, o_xh, replay,
         )
 
     def project_qkvz_sliced(self, x: torch.Tensor, bsz: int, seqlen: int) -> tuple:
@@ -962,20 +1263,23 @@ class GatedDeltaNet(Module):
         return qkv, z
 
 
-    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool):
+    def _bc_configure_slot(self, bsz: int, seqlen: int, history: bool, replay: bool = False):
         """Allocate (or fetch, if already cached at this exact shape) the per-(bsz, seqlen)
         statics for the BC_GatedDeltaNetSplit graph slot and hand them to C++. Called at most
-        once per (bsz, seqlen, history) combination per layer instance"""
+        once per (bsz, seqlen, history, replay) combination per layer instance"""
         device = self.device
         f = self.fdim_qkv
         nv, hv = self.num_v_heads, self.v_head_dim
         qkv             = g_tensor_cache.get(device, (bsz, seqlen, f), torch.float, "s_qkv")
         z               = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.float, "s_z")
         ba              = g_tensor_cache.get(device, (bsz, seqlen, 2 * nv), torch.float, "s_ba")
-        beta            = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
-        g               = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
-        mixed_qkv       = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
-        conv_out        = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
+        if replay:
+            mixed_qkv, conv_out, beta, g = self._bc_replay_statics(bsz, seqlen)
+        else:
+            beta        = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.bfloat16, "s_beta")
+            g           = g_tensor_cache.get(device, (bsz, seqlen, nv), torch.float, "s_g")
+            mixed_qkv   = g_tensor_cache.get(device, (bsz, f, seqlen), torch.bfloat16, "s_mqkv")
+            conv_out    = g_tensor_cache.get(device, (bsz, seqlen, f), torch.bfloat16, "s_conv")
         core_attn_out   = g_tensor_cache.get(device, (bsz, seqlen, nv, hv), torch.bfloat16, "s_cao")
         core_attn_out_f = g_tensor_cache.get(device, (bsz, seqlen, nv * hv), torch.half, "s_caof")
         qkv_xh = g_tensor_cache.get(device, (bsz, seqlen, self.hidden_size), torch.half, "s_qkv_xh")
@@ -984,7 +1288,7 @@ class GatedDeltaNet(Module):
         self.bc.configure_slot(
             bsz, seqlen, history,
             qkv, z, ba, beta, g, mixed_qkv, conv_out, core_attn_out, core_attn_out_f,
-            qkv_xh, z_xh, o_xh,
+            qkv_xh, z_xh, o_xh, replay,
         )
 
 
@@ -1037,6 +1341,10 @@ class GatedDeltaNet(Module):
             save_state = False
             save_history = False  # no SD without prior state, for simplicity
 
+        replay_verify = bool(save_state and rsl.replay_enabled and save_history)
+        if save_state and rsl.replay_enabled:
+            assert all(s.slot not in rsl.pending_replay for s in rsg), "Unresolved GDN verification"
+
         # Deferred fill of the merged b/a projection (weights are materialized by now)
         if self.bc_split and not self.ba_weight_filled and self.kda:
             self.dt_bias_bc.copy_(self.dt_bias)
@@ -1064,18 +1372,29 @@ class GatedDeltaNet(Module):
         # (_BC_MAX_BSZ, _BC_MAX_QLEN) and over save_history (needed for MTP draft/verify). Runs
         # the entire layer in one call, replayed through an internal CUDA graph per (bsz, seqlen,
         # history) shape from the third invocation of that shape on
-        if (
-            self.bc_split and save_state and
+        use_bc = (
+            _bc_gdn_enable and self.bc_split and save_state and
             recurrent_slots is not None and
             1 <= bsz <= _BC_MAX_BSZ and 1 <= seqlen <= _BC_MAX_QLEN
-        ):
-            if self.bc.needs_configure(bsz, seqlen, save_history):
+        )
+        # Replay verify through its own noncommitting graph slot, whose statics are this layer's
+        # records until rewind; any still unresolved (other slots or caches) are evicted to
+        # private copies first. Head dims batched_gdn_replay lacks verify eagerly
+        if use_bc and replay_verify:
+            use_bc = _bc_replay_enable and self.k_head_dim == 128 and self.v_head_dim == 128
+            if use_bc and self.bc_replay_storage is not None and self.bc_replay_storage.claims:
+                self.bc_replay_storage.evict()
+        if use_bc:
+            bc_history = save_history and not replay_verify
+            if self.bc.needs_configure(bsz, seqlen, bc_history, replay_verify):
                 if self.kda:
-                    self._bc_configure_slot_kda(bsz, seqlen, save_history)
+                    self._bc_configure_slot_kda(bsz, seqlen, bc_history, replay_verify)
                 else:
-                    self._bc_configure_slot(bsz, seqlen, save_history)
+                    self._bc_configure_slot(bsz, seqlen, bc_history, replay_verify)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, bc_history, replay_verify)
+            if replay_verify:
+                rsl.record_replay_bc(rsg, self.bc_replay_buffers[(bsz, seqlen)])
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y)
             return to2(y, out_dtype, self.out_dtype)
@@ -1165,14 +1484,18 @@ class GatedDeltaNet(Module):
                 self.beta_scale
             )
 
-        # Convolution
+        # Verification convolves against a private, K-entry window. The committed window
+        # stays untouched until acceptance. This temporary is small, unlike a recurrent state.
+        conv_input = mixed_qkv if replay_verify else None
+        conv_work = conv_state.index_select(0, recurrent_slots) if replay_verify else conv_state
+        conv_slots = None if replay_verify else recurrent_slots
         mixed_qkv = causal_conv1d_update(
             mixed_qkv = mixed_qkv,
-            conv_state = conv_state,
-            recurrent_slots = recurrent_slots,
+            conv_state = conv_work,
+            recurrent_slots = conv_slots,
             conv1d_weight = self.conv1d_weight_flat,
             conv1d_bias = self.conv1d_bias,
-            history = save_history,
+            history = save_history and not replay_verify,
             params = params,
             token_major = conv_token_major,
         )
@@ -1185,7 +1508,7 @@ class GatedDeltaNet(Module):
             recurrent_state = recurrent_state,
             recurrent_slots = recurrent_slots,
             history = save_history,
-            save_state = save_state,
+            save_state = save_state and not replay_verify,
             num_k_heads = self.num_k_heads,
             num_v_heads = self.num_v_heads,
             k_dim = self.k_dim,
@@ -1195,7 +1518,9 @@ class GatedDeltaNet(Module):
             params = params,
             channelwise_g = self.kda,
         )
-        del mixed_qkv, beta, g
+        if replay_verify:
+            rsl.record_replay(rsg, conv_input, mixed_qkv, beta, g, conv_token_major)
+        del mixed_qkv, beta, g, conv_input, conv_work
 
         # Norm
         core_attn_out = self.norm.forward(core_attn_out, params, gate = z)

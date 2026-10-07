@@ -106,6 +106,22 @@ Gated-delta-net (Qwen3-Next/3.5, KDA in GLM-5.3/Kimi Linear) counterpart of `EXL
 the decode step of a linear-attention layer runs as one graph-captured C++ call. Set to `0` to
 force the torch path, for A/B testing.
 
+### `EXL3_GDN_REPLAY` (default: `0`)
+
+Accepted-input replay for gated-delta-net layers under speculative decoding. Set to `1` and the
+cache keeps no per-draft-token recurrent-state history (about 0.15 GB per draft token on a
+48-layer model): the verify pass reads the committed state without writing it, and the rewind
+replays only the accepted prefix of the recorded verify inputs. The resulting state is bit-identical
+to the history path. Mamba2 layers keep their history.
+
+### `EXL3_BC_GDN_REPLAY` (default: `1`)
+
+With `EXL3_GDN_REPLAY=1`, the verify pass also runs as the graph-captured C++ call. Its conv
+input, post-conv q/k/v, beta and g stay in per-layer buffers (about 0.33 MB per layer for an
+8-row verify; shapes share power-of-two row buckets), and two launches per rewind (recurrent state, conv window) commit the accepted
+prefix of every layer (`batched_gdn_replay`). Set to `0` to verify on the torch path and replay layer by layer, for
+A/B testing.
+
 ### `EXL3_GDN_SUB_CHUNK` (default: `2048`)
 
 Prefill of a gated-delta-net / KDA layer runs the fla chunked scan over consecutive sub-ranges

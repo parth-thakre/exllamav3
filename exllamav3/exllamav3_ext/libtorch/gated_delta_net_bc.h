@@ -127,7 +127,13 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("norm"),
     py::arg("beta_scale")
 )
-.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure)
+.def_readonly("replay_graph_launches", &BC_GatedDeltaNetSplit::replay_graph_launches)
+.def("needs_configure", &BC_GatedDeltaNetSplit::needs_configure,
+    py::arg("bsz"),
+    py::arg("seqlen"),
+    py::arg("history"),
+    py::arg("replay") = false
+)
 .def("configure_slot_kda", &BC_GatedDeltaNetSplit::configure_slot_kda,
     py::arg("bsz"),
     py::arg("seqlen"),
@@ -145,7 +151,8 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("core_attn_out"),
     py::arg("core_attn_out_f"),
     py::arg("qkv_xh"),
-    py::arg("o_xh")
+    py::arg("o_xh"),
+    py::arg("replay") = false
 )
 .def("configure_slot", &BC_GatedDeltaNetSplit::configure_slot,
     py::arg("bsz"),
@@ -162,9 +169,18 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("core_attn_out_f"),
     py::arg("qkv_xh"),
     py::arg("z_xh"),
-    py::arg("o_xh")
+    py::arg("o_xh"),
+    py::arg("replay") = false
 )
-.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN)
+.def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN,
+    py::arg("x"),
+    py::arg("y"),
+    py::arg("conv_state"),
+    py::arg("recurrent_state"),
+    py::arg("slots"),
+    py::arg("history"),
+    py::arg("replay") = false
+)
 .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
     py::arg("ptrs_trellis"),
     py::arg("ptrs_suh"),

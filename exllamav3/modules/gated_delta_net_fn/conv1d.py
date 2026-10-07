@@ -420,7 +420,8 @@ def causal_conv1d_update(
         conv_state = torch.zeros((bsz, dim, conv1d_weight.shape[-1]), dtype = torch.bfloat16, device = mixed_qkv.device)
         dummy_slots = True
     else:
-        dummy_slots = False
+        # A compact private batch, such as replay's conv window, needs no slot indirection.
+        dummy_slots = recurrent_slots is None
 
     if (
         not token_major and

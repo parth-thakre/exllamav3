@@ -62,11 +62,12 @@ void BC_GatedDeltaNet::run_bsz1_b
     o_proj->run(core_attn_out_f, y);
 }
 
-bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history)
+bool BC_GatedDeltaNetSplit::needs_configure(int bsz, int seqlen, bool history, bool replay)
 {
     TORCH_CHECK(1 <= bsz && bsz <= MAX_BSZ && 1 <= seqlen && seqlen <= MAX_QLEN,
                 "BC_GatedDeltaNetSplit: shape out of range");
-    return !slot(bsz, seqlen, history).configured;
+    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
+    return !slot(bsz, seqlen, history, replay).configured;
 }
 
 void BC_GatedDeltaNetSplit::configure_slot
@@ -85,10 +86,12 @@ void BC_GatedDeltaNetSplit::configure_slot
     at::Tensor core_attn_out_f,
     at::Tensor qkv_xh,
     at::Tensor z_xh,
-    at::Tensor o_xh
+    at::Tensor o_xh,
+    bool replay
 )
 {
-    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
+    Slot& s = slot(bsz, seqlen, history, replay);
 
     s.qkv             = std::move(qkv);
     s.z               = std::move(z);
@@ -149,10 +152,12 @@ void BC_GatedDeltaNetSplit::configure_slot_kda
     at::Tensor core_attn_out,
     at::Tensor core_attn_out_f,
     at::Tensor qkv_xh,
-    at::Tensor o_xh
+    at::Tensor o_xh,
+    bool replay
 )
 {
-    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit: replay verify never writes history");
+    Slot& s = slot(bsz, seqlen, history, replay);
 
     s.qkv             = std::move(qkv);
     s.z               = std::move(z);
@@ -221,6 +226,7 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
     bool history,
+    bool replay,
     Slot& s,
     Graph* graph
 )
@@ -287,6 +293,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         );
     }
 
+    // Replay verify: both read the committed conv window / state and write neither (save_state =
+    // false), leaving s.mixed_qkv, s.conv_out, s.beta and s.g as the record to commit on rewind
     cuda_causal_conv1d_update_gr
     (
         s.mixed_qkv,
@@ -297,7 +305,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         s.conv_out,
         true,
         history,
-        graph
+        graph,
+        !replay
     );
 
     cuda_recurrent_gated_delta_rule_gr
@@ -313,7 +322,8 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         v_head_dim,
         slots,
         history,
-        graph
+        graph,
+        !replay
     );
 
     norm->run_gr(s.core_attn_out, s.core_attn_out_f, s.z, graph);
@@ -330,7 +340,8 @@ void BC_GatedDeltaNetSplit::run_bszN
     at::Tensor& conv_state,
     at::Tensor& recurrent_state,
     const at::Tensor& slots,
-    bool history
+    bool history,
+    bool replay
 )
 {
     py::gil_scoped_release release;
@@ -341,12 +352,13 @@ void BC_GatedDeltaNetSplit::run_bszN
     int seqlen = (int) x.size(1);
     TORCH_CHECK(bsz >= 1 && bsz <= MAX_BSZ && seqlen >= 1 && seqlen <= MAX_QLEN,
                 "BC_GatedDeltaNetSplit::run_bszN: shape out of range");
-    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(!(history && replay), "BC_GatedDeltaNetSplit::run_bszN: replay verify never writes history");
+    Slot& s = slot(bsz, seqlen, history, replay);
     TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN: slot not configured");
 
     if (s.graph->disabled || (!s.graph->ready && !s.graph->ready_to_record))
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, nullptr);
         s.graph->ready_to_record = true;
         s.graph_state_size = (int) conv_state.size(2);
         s.graph_hist_stride = (int) recurrent_state.size(1);
@@ -359,14 +371,14 @@ void BC_GatedDeltaNetSplit::run_bszN
     if ((int) conv_state.size(2) != s.graph_state_size ||
         (int) recurrent_state.size(1) != s.graph_hist_stride)
     {
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, nullptr);
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, nullptr);
         return;
     }
 
     if (!s.graph->ready)
     {
         s.graph->capture_begin();
-        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, s.graph.get());
+        run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, replay, s, s.graph.get());
         s.graph->capture_end();
     }
 
@@ -414,6 +426,7 @@ void BC_GatedDeltaNetSplit::run_bszN
         args.emplace_back(GP_add_z, (void*) y.data_ptr());
     }
     s.graph->launch(args, stream);
+    if (replay) replay_graph_launches++;
 }
 
 bool BC_Mamba2::needs_configure(int bsz, int seqlen, bool history)

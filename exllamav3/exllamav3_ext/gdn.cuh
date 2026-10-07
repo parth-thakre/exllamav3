@@ -33,6 +33,7 @@ void gated_delta_net_fused_op_2
     const float beta_scale
 );
 
+// save_state=false reads committed state and produces outputs without changing state or history.
 void cuda_recurrent_gated_delta_rule
 (
     const at::Tensor& mixed_qkv,
@@ -45,7 +46,8 @@ void cuda_recurrent_gated_delta_rule
     int k_head_dim,
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
-    bool history
+    bool history,
+    bool save_state = true
 );
 
 void cuda_recurrent_gated_delta_rule_gr
@@ -61,7 +63,8 @@ void cuda_recurrent_gated_delta_rule_gr
     int v_head_dim,
     const c10::optional<at::Tensor>& slots,
     bool history,
-    Graph* graph
+    Graph* graph,
+    bool save_state = true
 );
 
 // Mamba2 discretization: dt = clamp(softplus(dt_raw + dt_bias), dt_min, dt_max), g = -exp(a_log) * dt
@@ -129,6 +132,7 @@ void cuda_recurrent_mamba2_gr
     Graph* graph
 );
 
+// save_state=false reads the committed window and leaves conv_state unchanged (requires !history)
 void cuda_causal_conv1d_update
 (
     const at::Tensor& x,
@@ -138,7 +142,8 @@ void cuda_causal_conv1d_update
     const c10::optional<at::Tensor>& bias,
     at::Tensor& out,
     bool activation,
-    bool history
+    bool history,
+    bool save_state = true
 );
 
 void cuda_causal_conv1d_update_gr
@@ -151,7 +156,8 @@ void cuda_causal_conv1d_update_gr
     at::Tensor& out,
     bool activation,
     bool history,
-    Graph* graph
+    Graph* graph,
+    bool save_state = true
 );
 
 // Split-projection (Qwen3.5) helper: cast/transpose qkv to bf16 mixed_qkv and compute beta/g from
@@ -248,3 +254,42 @@ struct StateRewindJob
 
 void batched_conv_rewind(std::vector<ConvRewindJob> const& jobs, int device_index);
 void batched_state_rewind(std::vector<StateRewindJob> const& jobs, int device_index);
+
+// Accepted-input replay commit for one state slot of one layer (EXL3_GDN_REPLAY). Addresses are
+// row/slot bases: recurrent_state = the slot's committed plane (float [Nv, 128, 128]), conv_state =
+// the slot's window (bf16 [F, conv_stride]); the recorded verify row holds conv_input (bf16
+// [F, seqlen], channel-major), conv_out (bf16 [seqlen, F]), beta (bf16 [seqlen, Nv]) and g (float
+// [seqlen, Nv], or [seqlen, Nv, 128] channelwise)
+struct GDNReplayJob
+{
+    uintptr_t recurrent_state;
+    uintptr_t conv_state;
+    uintptr_t conv_input;
+    uintptr_t conv_out;
+    uintptr_t beta;
+    uintptr_t g;
+
+    GDNReplayJob() = default;
+    GDNReplayJob(uintptr_t _recurrent_state, uintptr_t _conv_state, uintptr_t _conv_input,
+                 uintptr_t _conv_out, uintptr_t _beta, uintptr_t _g) :
+        recurrent_state(_recurrent_state), conv_state(_conv_state), conv_input(_conv_input),
+        conv_out(_conv_out), beta(_beta), g(_g) {}
+};
+
+// Commit the first `accepted` recorded tokens of every job: one recurrent-scan launch and one
+// conv-window launch per 64 jobs. All jobs share the geometry and record length `seqlen`
+void batched_gdn_replay
+(
+    std::vector<GDNReplayJob> const& jobs,
+    int device_index,
+    int accepted,
+    int seqlen,
+    int num_k_heads,
+    int num_v_heads,
+    int k_head_dim,
+    int v_head_dim,
+    int conv_dim,
+    int conv_k,
+    int conv_stride,
+    bool channelwise
+);

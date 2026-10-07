@@ -1293,9 +1293,12 @@ class Generator:
                             job.prepare_logit_mask()
                             job.prepare_sampling_past_ids()
 
-                # Make sure outgoing state is valid if entire draft was accepted
+                # Full acceptance also commits pending GDN replay. Completed rows need no
+                # commit: release_state discards their unresolved verification inputs.
                 if batch_states and draft_tokens is not None and rejected == 0:
-                    batch_states[j].rewind(0)
+                    state = batch_states[j]
+                    if not (eos and not rq and getattr(state, "replay_enabled", False)):
+                        state.rewind(0)
 
                 # Record per-round draft stats. Skip abandoned windows (banned-string rewind);
                 # checkpoint-boundary truncations are rare enough to count as ordinary rejections.

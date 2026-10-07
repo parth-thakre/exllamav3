@@ -231,10 +231,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
     m.def("gated_delta_net_fused_op", &gated_delta_net_fused_op, "gated_delta_net_fused_op");
     m.def("gated_delta_net_fused_op_2", &gated_delta_net_fused_op_2, "gated_delta_net_fused_op_2");
-    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule");
+    m.def("cuda_recurrent_gated_delta_rule", &cuda_recurrent_gated_delta_rule, "cuda_recurrent_gated_delta_rule",
+        py::arg("mixed_qkv"), py::arg("g"), py::arg("beta"), py::arg("recurrent_state"),
+        py::arg("core_attn_out"), py::arg("num_k_heads"), py::arg("num_v_heads"),
+        py::arg("k_head_dim"), py::arg("v_head_dim"), py::arg("slots"), py::arg("history"),
+        py::arg("save_state") = true);
     m.def("mamba2_dt_op", &mamba2_dt_op, "mamba2_dt_op");
     m.def("cuda_recurrent_mamba2", &cuda_recurrent_mamba2, "cuda_recurrent_mamba2");
-    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update");
+    m.def("cuda_causal_conv1d_update", &cuda_causal_conv1d_update, "cuda_causal_conv1d_update",
+        py::arg("x"), py::arg("conv_state"), py::arg("slots"), py::arg("weight"), py::arg("bias"),
+        py::arg("out"), py::arg("activation"), py::arg("history"), py::arg("save_state") = true);
     m.def("gdn_ba_gemv", &gdn_ba_gemv, "gdn_ba_gemv");
     m.def("gdn_lowrank_gemv_f", [](const at::Tensor& x, const at::Tensor& w_t, at::Tensor& y)
         { gdn_lowrank_gemv_f_gr(x, w_t, y, nullptr); }, "gdn_lowrank_gemv_f");
@@ -251,6 +257,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def(py::init<uintptr_t, uintptr_t, int64_t>());
     m.def("batched_conv_rewind", &batched_conv_rewind, py::arg("jobs"), py::arg("device_index"));
     m.def("batched_state_rewind", &batched_state_rewind, py::arg("jobs"), py::arg("device_index"));
+    py::class_<GDNReplayJob>(m, "GDNReplayJob")
+        .def(py::init<uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t>());
+    m.def("batched_gdn_replay", &batched_gdn_replay,
+        py::arg("jobs"), py::arg("device_index"), py::arg("accepted"), py::arg("seqlen"),
+        py::arg("num_k_heads"), py::arg("num_v_heads"), py::arg("k_head_dim"), py::arg("v_head_dim"),
+        py::arg("conv_dim"), py::arg("conv_k"), py::arg("conv_stride"), py::arg("channelwise"));
 
     m.def("argmax_sample", &argmax_sample, "argmax_sample");
     m.def("gumbel_sample", &gumbel_sample, "gumbel_sample");

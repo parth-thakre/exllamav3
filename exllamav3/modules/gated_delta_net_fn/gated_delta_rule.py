@@ -134,16 +134,20 @@ def gated_delta_rule_fn(
     v_head_dim: int,
     params: dict = None,
     channelwise_g: bool = False,
+    force_recurrent: bool = False,
 ):
     if params is None:
         params = {}
 
     bsz, seqlen, _ = mixed_qkv.shape
+    # Preserve the ordinary no-cache scan's temporary-state writes. Only a real committed
+    # state supplied with save_state=False needs the read-only recurrent specialization.
+    commit_recurrent = save_state or recurrent_state is None
 
     # KDA (per-k-channel decay, g shaped (b, s, h, dk)): fla chunk kernel for prefill, the
     # channelwise CUDA recurrent kernel (in-kernel q/k l2norm, history-capable) otherwise
     if channelwise_g:
-        if seqlen >= num_v_heads and not history:
+        if seqlen >= num_v_heads and not history and not force_recurrent:
             from ...vendor.fla import chunk_kda
             q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
             q = q.view(bsz, seqlen, -1, k_head_dim)
@@ -187,12 +191,13 @@ def gated_delta_rule_fn(
             k_head_dim,
             v_head_dim,
             recurrent_slots,
-            history,
+            history and commit_recurrent,
+            commit_recurrent,
         )
         return core_attn_out
 
     # Chunked rule
-    if seqlen >= num_v_heads and not history:
+    if seqlen >= num_v_heads and not history and not force_recurrent:
         from ...vendor.fla import chunk_gated_delta_rule
 
         q, k, v = torch.split(mixed_qkv, [k_dim, k_dim, v_dim], dim = -1)
@@ -243,7 +248,8 @@ def gated_delta_rule_fn(
             k_head_dim,
             v_head_dim,
             recurrent_slots,
-            history,
+            history and commit_recurrent,
+            commit_recurrent,
         )
 
     return core_attn_out

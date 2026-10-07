@@ -208,6 +208,11 @@ class Cache:
         if model is None:
             model = self.model
 
+        # Unresolved GDN verifications die with the cache (TP: on every worker), and with them their
+        # claims on the modules' shared replay storage. An uninitialized cache holds none
+        if model is self.model and self.initialized:
+            self._discard_replay()
+
         del model.cache_weakrefs[id(self)]
 
         cl = model.get_cache_layers()
@@ -366,10 +371,24 @@ class Cache:
         )
 
 
+    def _discard_replay(self, slot = None):
+        if not any(getattr(layer, "replay_enabled", False) for layer in self.recurrent_layers.values()):
+            return
+        if self.model.loaded_tp:
+            from ..modules.gated_delta_net import mp_cache_recurrent_discard_replay
+            self.model.tp_dispatch_all(mp_cache_recurrent_discard_replay, (id(self), slot))
+        else:
+            for layer in self.recurrent_layers.values():
+                discard = getattr(layer, "discard_replay", None)
+                if discard is not None:
+                    discard(slot)
+
+
     def release_state(self, state):
         """
-        Return state to the pool
+        Return state to the pool, dropping any abandoned verification before slot reuse.
         """
+        self._discard_replay(state.slot)
         self.free_list.appendleft(state.slot)
 
 
@@ -377,6 +396,7 @@ class Cache:
         """
         Return every state slot to the pool. A Generator calls this when it takes ownership of the cache.
         """
+        self._discard_replay()
         self.free_list = deque(range(self.num_slots))
 
 

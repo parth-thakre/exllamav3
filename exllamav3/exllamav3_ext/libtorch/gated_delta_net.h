@@ -105,6 +105,11 @@ struct BC_GatedDeltaNet
 // Split-projection GDN, generalized over (bsz, seqlen) up to MAX_BSZ x MAX_QLEN and over
 // save_history (captured graph is tied to a specific history-branch kernel). Each (bsz, seqlen)
 // shape gets its own lazily-configured Slot with exact-size scratch statics
+//
+// replay = true is the accepted-input replay verify (EXL3_GDN_REPLAY): conv and recurrent scan
+// read the committed state without writing it, and the slot's mixed_qkv / conv_out / beta / g
+// statics double as the verification record (python makes them per-layer for these slots), which
+// batched_gdn_replay later commits up to the accepted length. Its own slot set, never history
 struct BC_GatedDeltaNetSplit
 {
     static constexpr int MAX_BSZ = 8;
@@ -192,6 +197,8 @@ struct BC_GatedDeltaNetSplit
     };
     std::vector<Slot> slots;        // history == false (only seqlen == 1 ever populated)
     std::vector<Slot> slots_hist;   // history == true
+    std::vector<Slot> slots_replay; // replay == true (noncommitting verify)
+    long replay_graph_launches = 0; // captured-graph launches of replay slots (tests)
 
 
     BC_GatedDeltaNetSplit
@@ -230,11 +237,12 @@ struct BC_GatedDeltaNetSplit
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
+        slots_replay.resize(MAX_BSZ * MAX_QLEN);
     }
 
-    Slot& slot(int bsz, int seqlen, bool history)
+    Slot& slot(int bsz, int seqlen, bool history, bool replay = false)
     {
-        std::vector<Slot>& v = history ? slots_hist : slots;
+        std::vector<Slot>& v = replay ? slots_replay : history ? slots_hist : slots;
         return v[(bsz - 1) * MAX_QLEN + (seqlen - 1)];
     }
 
@@ -283,9 +291,10 @@ struct BC_GatedDeltaNetSplit
     {
         slots.resize(MAX_BSZ * MAX_QLEN);
         slots_hist.resize(MAX_BSZ * MAX_QLEN);
+        slots_replay.resize(MAX_BSZ * MAX_QLEN);
     }
 
-    bool needs_configure(int bsz, int seqlen, bool history);
+    bool needs_configure(int bsz, int seqlen, bool history, bool replay = false);
 
     void configure_slot_kda
     (
@@ -305,7 +314,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor core_attn_out,
         at::Tensor core_attn_out_f,
         at::Tensor qkv_xh,
-        at::Tensor o_xh
+        at::Tensor o_xh,
+        bool replay = false
     );
 
     void configure_slot
@@ -324,7 +334,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor core_attn_out_f,
         at::Tensor qkv_xh,
         at::Tensor z_xh,
-        at::Tensor o_xh
+        at::Tensor o_xh,
+        bool replay = false
     );
 
     void run_bszN_gr
@@ -335,6 +346,7 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
         bool history,
+        bool replay,
         Slot& s,
         Graph* graph
     );
@@ -346,7 +358,8 @@ struct BC_GatedDeltaNetSplit
         at::Tensor& conv_state,
         at::Tensor& recurrent_state,
         const at::Tensor& slots,
-        bool history
+        bool history,
+        bool replay = false
     );
 };
 
